@@ -85,6 +85,12 @@ RUN useradd -m -s /bin/bash ${USERNAME} && \
 
 COPY home/yolo/ /home/${USERNAME}/
 
+# When pi is installed, require the models.json template to exist in the image
+RUN if [ "${INSTALL_PI}" = "true" ]; then \
+        test -f /home/${USERNAME}/.pi/agent/models.json.template \
+          || (echo "Missing home/yolo/.pi/agent/models.json.template (required when INSTALL_PI=true)" >&2 && exit 1); \
+    fi
+
 # Fetch GitHub public keys (only if GITHUB_USERNAME is set)
 RUN mkdir -p /home/${USERNAME}/.ssh && \
     if [ -n "${GITHUB_USERNAME}" ]; then \
