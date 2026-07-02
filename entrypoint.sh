@@ -112,8 +112,14 @@ if [ "${INSTALL_PI}" = "true" ]; then
     if [ -n "${LLM_ENDPOINT}" ]; then
         # Remove trailing slash if present
         LLM_ENDPOINT="${LLM_ENDPOINT%/}"
-        
-        echo "entrypoint: fetching models from ${LLM_ENDPOINT}/v1/models"
+
+        # Transport for the generated provider. Defaults to the built-in
+        # openai-completions. Set LLM_API=anthropic-no-timeout for a slow endpoint
+        # (big model on slow hardware) that speaks the Anthropic Messages protocol;
+        # that api is provided by the anthropic-no-timeout extension.
+        LLM_API="${LLM_API:-openai-completions}"
+
+        echo "entrypoint: fetching models from ${LLM_ENDPOINT}/v1/models (api=${LLM_API})"
         
         # Fetch models from OpenAI-compatible endpoint (include API key if provided)
         CURL_ARGS=(--max-time 10 -s "${LLM_ENDPOINT}/v1/models")
@@ -123,18 +129,19 @@ if [ "${INSTALL_PI}" = "true" ]; then
         MODELS_RESPONSE=$(curl "${CURL_ARGS[@]}" 2>/dev/null || echo "")
         
         if [ -n "${MODELS_RESPONSE}" ] && echo "${MODELS_RESPONSE}" | jq -e '.data' >/dev/null 2>&1; then
-            # Successfully fetched models - generate models.json with anthropic-no-timeout provider
+            # Successfully fetched models - generate the "work" provider using ${LLM_API}
             echo "entrypoint: discovered $(echo "${MODELS_RESPONSE}" | jq '.data | length') models"
-            
-            # Generate models.json with discovered models
-            # Using anthropic-no-timeout provider from extension (disabled body timeout)
-            # Note: baseUrl does NOT include /v1 - the Anthropic SDK adds it internally
+
+            # Generate models.json with discovered models under the selected api.
+            # maxTokens is set explicitly: the anthropic-no-timeout transport derives its
+            # request max_tokens from model.maxTokens, so leaving it unset breaks that api.
+            # Note: baseUrl does NOT include /v1 - the SDK adds it internally
             cat > "$MODELS_JSON" << EOF
 {
   "providers": {
     "work": {
       "baseUrl": "${LLM_ENDPOINT}",
-      "api": "openai-completions",
+      "api": "${LLM_API}",
       "apiKey": "${LLM_API_KEY:-not-needed-for-local}",
       "models": $(echo "${MODELS_RESPONSE}" | jq '[.data[] | {
         id: .id,
@@ -142,7 +149,8 @@ if [ "${INSTALL_PI}" = "true" ]; then
         reasoning: false,
         input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: (.context_window // 131072)
+        contextWindow: (.context_window // 131072),
+        maxTokens: 8192
       }]')
     }
   }
@@ -183,9 +191,99 @@ EOF
 EOF
         echo "entrypoint: created default $MODELS_JSON - edit to configure your models"
     fi
-    
-    chown -R "${USERNAME}:${USERNAME}" "$USER_HOME/.pi"
+
+    # pi-subagents extension: subagents spawn as isolated `pi` processes, so they need to be
+    # told which local model to use and (when the model's api comes from an extension) which
+    # provider extension to load. Generate its config.json from the discovered model + transport.
+    SUBAGENT_EXT_DIR="$AGENT_DIR/extensions/pi-subagents"
+    if [ -f "$SUBAGENT_EXT_DIR/index.ts" ]; then
+        SUBAGENT_MODEL_ID="$(echo "${MODELS_RESPONSE:-}" | jq -r '.data[0].id // empty' 2>/dev/null || echo "")"
+        [ -z "$SUBAGENT_MODEL_ID" ] && SUBAGENT_MODEL_ID="default"
+        if [ "${LLM_API:-openai-completions}" = "anthropic-no-timeout" ]; then
+            SUBAGENT_EXTRA='["anthropic-no-timeout"]'
+        else
+            SUBAGENT_EXTRA='[]'
+        fi
+        # If the combined pi-searxng extension is built, point the web_search/web_fetch
+        # tools at it (both map to the same entry so the child loads it once).
+        SUBAGENT_TOOLEXT='{}'
+        if [ -f "$AGENT_DIR/extensions/pi-searxng/dist/index.js" ]; then
+            SUBAGENT_TOOLEXT='{"web_search":"pi-searxng/dist/index.js","web_fetch":"pi-searxng/dist/index.js"}'
+        fi
+        echo "entrypoint: writing pi-subagents config (model=work/${SUBAGENT_MODEL_ID}, extraExtensions=${SUBAGENT_EXTRA}, toolExtensions=${SUBAGENT_TOOLEXT})"
+        jq -n \
+          --arg model "work/${SUBAGENT_MODEL_ID}" \
+          --argjson extra "${SUBAGENT_EXTRA}" \
+          --argjson te "${SUBAGENT_TOOLEXT}" \
+          '{maxConcurrency: 4, modelOverride: $model, extraExtensions: $extra, toolExtensions: $te}' \
+          > "$SUBAGENT_EXT_DIR/config.json"
+    fi
+
+    # pi-searxng: write config.json from SEARXNG_URL. SSH logins don't inherit the container
+    # env, so the extension can't rely on $SEARXNG_URL at runtime — bake it into the config.
+    SEARXNG_EXT_DIR="$AGENT_DIR/extensions/pi-searxng"
+    if [ -f "$SEARXNG_EXT_DIR/dist/index.js" ] && [ -n "${SEARXNG_URL:-}" ]; then
+        echo "entrypoint: writing pi-searxng config (searxngUrl=${SEARXNG_URL%/})"
+        jq -n --arg url "${SEARXNG_URL%/}" '{searxngUrl: $url}' > "$SEARXNG_EXT_DIR/config.json"
+    fi
+
+    # $USER_HOME/.pi is a symlink into the persisted /workspace/.home (see linking above).
+    # `chown -R` does NOT traverse a symlinked top-level argument, so chowning the symlink
+    # is a no-op on the real files: models.json (and any dir mkdir'd here by root) would stay
+    # root-owned and unreadable by $USERNAME once chmod 600'd. Chown the real target instead.
+    chown -R "${USERNAME}:${USERNAME}" "$WORKSPACE_HOME/.pi"
     chmod 600 "$MODELS_JSON"
+fi
+
+# --- Claude Code local-LLM settings (optional, gated by CLAUDE_LOCAL_LLM) ---
+# When CLAUDE_LOCAL_LLM=true, point Claude Code at a local Anthropic Messages-compatible
+# endpoint by generating ~/.claude/settings.json. Base URL / token default to the same
+# LLM_ENDPOINT / LLM_API_KEY used for pi (override with CLAUDE_BASE_URL / CLAUDE_AUTH_TOKEN).
+# The model defaults to the first model discovered at the endpoint (override with CLAUDE_MODEL).
+# ANTHROPIC_BASE_URL must NOT include /v1 - Claude Code appends it.
+if [ "${CLAUDE_LOCAL_LLM:-}" = "true" ]; then
+    CLAUDE_DIR="$USER_HOME/.claude"
+    CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
+    mkdir -p "$CLAUDE_DIR"
+
+    CC_BASE_URL="${CLAUDE_BASE_URL:-${LLM_ENDPOINT:-}}"
+    CC_BASE_URL="${CC_BASE_URL%/}"
+    CC_TOKEN="${CLAUDE_AUTH_TOKEN:-${LLM_API_KEY:-not-needed}}"
+    CC_MODEL="${CLAUDE_MODEL:-}"
+
+    # Auto-discover the model id from the endpoint when not set explicitly.
+    if [ -z "$CC_MODEL" ] && [ -n "$CC_BASE_URL" ]; then
+        DISC_ARGS=(--max-time 10 -s "${CC_BASE_URL}/v1/models")
+        [ "$CC_TOKEN" != "not-needed" ] && DISC_ARGS+=(-H "Authorization: Bearer ${CC_TOKEN}")
+        CC_MODEL="$(curl "${DISC_ARGS[@]}" 2>/dev/null | jq -r '.data[0].id // empty' 2>/dev/null || echo "")"
+    fi
+
+    if [ -z "$CC_BASE_URL" ] || [ -z "$CC_MODEL" ]; then
+        echo "entrypoint: warning - CLAUDE_LOCAL_LLM=true but base URL or model could not be resolved; skipping settings.json" >&2
+        echo "entrypoint: set CLAUDE_BASE_URL/LLM_ENDPOINT and CLAUDE_MODEL (or ensure {base}/v1/models is reachable)" >&2
+    else
+        echo "entrypoint: writing Claude Code local-LLM settings (model=${CC_MODEL}, base=${CC_BASE_URL})"
+        cat > "$CLAUDE_SETTINGS" << EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "${CC_BASE_URL}",
+    "ANTHROPIC_AUTH_TOKEN": "${CC_TOKEN}",
+    "ANTHROPIC_MODEL": "${CC_MODEL}",
+    "ANTHROPIC_SMALL_FAST_MODEL": "${CC_MODEL}",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "${CC_MODEL}",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "${CC_MODEL}",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${CC_MODEL}",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "theme": "dark",
+  "skipDangerousModePermissionPrompt": true
+}
+EOF
+        # Chown the file directly (not -R on the symlinked ~/.claude) and lock it down
+        # since it holds the auth token.
+        chown "${USERNAME}:${USERNAME}" "$CLAUDE_SETTINGS"
+        chmod 600 "$CLAUDE_SETTINGS"
+    fi
 fi
 
 exec "$@"

@@ -1,8 +1,12 @@
 /**
- * Anthropic Provider with Disabled Body Timeout
- * 
- * Simple provider for local Anthropic-compatible servers (vLLM, LM Studio)
- * with disabled body timeout to prevent UND_ERR_BODY_TIMEOUT errors.
+ * Custom "anthropic-no-timeout" api (transport) with disabled body timeout.
+ *
+ * Registers an api handler (not an endpoint) that speaks the Anthropic Messages
+ * protocol (POST /v1/messages) with undici body/headers timeouts disabled, to
+ * prevent UND_ERR_BODY_TIMEOUT on slow endpoints (e.g. a big model on slow home
+ * hardware). Select it per-provider in models.json with `"api": "anthropic-no-timeout"`.
+ * The target server must be Anthropic Messages-compatible — OpenAI-compatible
+ * servers should use the built-in `openai-completions` api instead.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -22,8 +26,8 @@ import {
 	type ToolCall,
 	type TextContent,
 	type ThinkingContent,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Custom fetch with disabled body timeout
 const dispatcher = new Agent({ bodyTimeout: 0, headersTimeout: 0 });
@@ -135,7 +139,13 @@ function streamAnthropicNoTimeout(
 				}));
 			}
 
-			const anthropicStream = await client.messages.stream(params, { signal: options?.signal });
+			// Use the raw streaming iterator (create) rather than the high-level .stream()
+			// helper: this transport targets local/proxy endpoints (e.g. litellm) whose SSE
+			// can violate the strict Anthropic event ordering the MessageStream accumulator
+			// enforces (litellm emits a duplicate message_start, which .stream() rejects with
+			// "Unexpected event order"). Our own event loop below reconstructs the message
+			// and tolerates the duplicate, so the raw iterator is the right fit here.
+			const anthropicStream = await client.messages.create(params, { signal: options?.signal });
 
 			stream.push({ type: "start", partial: output });
 
@@ -222,12 +232,16 @@ function streamAnthropicNoTimeout(
 }
 
 export default function (pi: ExtensionAPI) {
-	// Register provider capability - models added via LLM_ENDPOINT or models.json
+	// Register a custom *api* (transport), not a concrete endpoint. pi keys the
+	// streamSimple handler by the `api` string (see registerApiProvider), so any
+	// provider in models.json can opt in per-endpoint via `"api": "anthropic-no-timeout"`
+	// while keeping its own baseUrl/apiKey. Example models.json:
+	//   "work": { "baseUrl": "http://fast:8001", "api": "openai-completions", "models": [...] }
+	//   "home": { "baseUrl": "http://slow:8001", "api": "anthropic-no-timeout", "models": [...] }
+	// baseUrl, apiKey and model id are read from the selecting provider's model at stream time
+	// (see streamAnthropicNoTimeout); no baseUrl/models are set here on purpose.
 	pi.registerProvider("anthropic-no-timeout", {
-		baseUrl: "",  // Set per-model via models.json
-		apiKey: process.env.LLM_API_KEY || "not-needed",
-		api: "anthropic",
-		models: [],  // Empty - models added via LLM_ENDPOINT or models.json
+		api: "anthropic-no-timeout",
 		streamSimple: streamAnthropicNoTimeout,
 	});
 }

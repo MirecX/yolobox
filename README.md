@@ -31,7 +31,7 @@ When using Claude Code's "yolo mode", the AI can execute arbitrary commands with
 - **Node.js**: Latest LTS version
 - **.NET**: SDK 10.0
 - **Claude Code CLI**: Pre-installed
-- **pi-coding-agent** (optional): `@mariozechner/pi-coding-agent` with a body-timeout patch for slow LLM backends — see [pi-coding-agent](#pi-coding-agent-optional)
+- **pi-coding-agent** (optional): `@earendil-works/pi-coding-agent` with a body-timeout patch for slow LLM backends — see [pi-coding-agent](#pi-coding-agent-optional)
 - **anthropic-no-timeout extension** (optional): Custom Anthropic provider with disabled body timeout for long streaming responses — see [anthropic-no-timeout Extension](#anthropic-no-timeout-extension-optional)
 - **SSH Server**: Hardened configuration with key-based authentication only
 - **Development Tools**: vim, mc, git, tmux, screen, curl, wget, jq, and more
@@ -171,7 +171,7 @@ This allows Claude to execute commands without confirmation prompts, safely cont
 
 ## pi-coding-agent (optional)
 
-[`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) is installed globally by default
+[`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) is installed globally by default (the project migrated from the now-deprecated `@mariozechner/pi-coding-agent`; see [earendil-works/pi](https://github.com/earendil-works/pi))
 
 ### Enabling / disabling
 
@@ -197,13 +197,15 @@ LLM_ENDPOINT=http://host.docker.internal:11434  # Ollama on host
 
 The entrypoint script will:
 1. Fetch available models from `{LLM_ENDPOINT}/v1/models`
-2. Generate `~/.pi/agent/models.json` with all discovered models
-3. Use the `anthropic-no-timeout` provider for compatibility
+2. Generate a `work` provider in `~/.pi/agent/models.json` with all discovered models
+3. Set its `api` (transport) from `LLM_API` (default `openai-completions`)
 
 **Example `.env`:**
 
 ```bash
 LLM_ENDPOINT=http://127.0.0.1:8001
+# LLM_API=openai-completions            # default; use for OpenAI-compatible servers
+# LLM_API=anthropic-no-timeout          # slow Anthropic-Messages endpoint (see below)
 ```
 
 That's it! After `docker compose up -d`, connect and run:
@@ -215,6 +217,27 @@ pi
 ```
 
 **No LLM_ENDPOINT?** A default placeholder config is created that you can edit manually inside the container.
+
+### anthropic-no-timeout Extension (optional)
+
+`anthropic-no-timeout` is a custom pi **api** (transport), not a provider — it speaks the
+Anthropic Messages protocol with undici body/headers timeouts disabled, so a large model on
+slow hardware won't trip `UND_ERR_BODY_TIMEOUT` mid-stream. Because pi keys stream handlers by
+`api`, any provider can opt in per-endpoint. This lets you mix a fast and a slow backend:
+
+```json
+{
+  "providers": {
+    "work": { "baseUrl": "http://fast:8001",  "api": "openai-completions",   "apiKey": "…", "models": [ … ] },
+    "home": { "baseUrl": "http://slow:8001",   "api": "anthropic-no-timeout", "apiKey": "…", "models": [ … ] }
+  }
+}
+```
+
+The target of an `anthropic-no-timeout` model must be **Anthropic Messages-compatible**
+(`POST /v1/messages`); OpenAI-compatible servers should use the built-in `openai-completions`.
+For a single auto-discovered endpoint, set `LLM_API=anthropic-no-timeout` instead of editing JSON.
+Requires `INSTALL_PI=true` (the extension ships in `home/yolo/.pi/agent/extensions/`).
 
 ### Manual Configuration (Advanced)
 
@@ -237,6 +260,91 @@ pi                              # launch pi-coding-agent
 /model                          # select a model
 ```
 
+## pi-subagents Extension (optional)
+
+[pi-subagents](https://github.com/MirecX/pi-subagents) registers a `subagent` tool that
+dispatches isolated `pi` subprocesses (agents: `scout`, `researcher`, `worker`). It is
+**installed from its own repo at build time** (not vendored) — yolobox only owns the
+box-specific config generated at runtime. Requires `INSTALL_PI=true`.
+
+Point the build at a fork or pin a version with build args:
+
+```bash
+docker build \
+  --build-arg PI_SUBAGENTS_REPO=https://github.com/MirecX/pi-subagents \
+  --build-arg PI_SUBAGENTS_REF=main \    # branch, tag, or commit SHA
+  -t yoloimage .
+```
+
+Because subagents run as isolated `pi` processes (spawned with `--no-extensions`), they need
+to be told which local model to use and which provider extension to load. The entrypoint
+generates `~/.pi/agent/extensions/pi-subagents/config.json` from the same discovery used for
+`models.json`:
+
+```json
+{
+  "maxConcurrency": 4,
+  "modelOverride": "work/<discovered-model>",
+  "extraExtensions": ["anthropic-no-timeout"]   // only when LLM_API=anthropic-no-timeout
+}
+```
+
+- `modelOverride` forces every agent onto the box's local model (ignoring the cloud models in
+  each agent's frontmatter).
+- `extraExtensions` re-adds provider/api extensions into the subagent process so a model on a
+  custom api (e.g. `anthropic-no-timeout`) can resolve its provider.
+
+The `researcher`/`worker` agents use `web_search` and `web_fetch`, which are provided by the
+pi-searxng extension (below); the entrypoint points pi-subagents' `toolExtensions` at it
+automatically. `scout` (read/grep/find/ls) needs no web tools.
+
+## Web search & fetch (pi-searxng extension)
+
+Web tools come from [pi-searxng](https://github.com/MirecX/pi-searxng) (forked and extended
+with a `web_fetch` tool), cloned and built at image build (build args `PI_SEARXNG_REPO`/`REF`;
+requires `INSTALL_PI=true`). It registers:
+
+- **`web_search`** — queries a [SearXNG](https://github.com/searxng/searxng) instance
+- **`web_fetch`** — fetches a page/PDF and extracts clean Markdown (Readability + Turndown,
+  `unpdf` for PDFs, optional Jina Reader fallback)
+
+**SearXNG is a shared, external service** — run **one** instance and point every box at it via
+`SEARXNG_URL` (no SearXNG is bundled per box). Port **9369** by convention:
+
+```bash
+# .env
+SEARXNG_URL=http://searxng.lan:9369        # your shared SearXNG on the LAN
+```
+
+`web_search` needs a reachable SearXNG; `web_fetch` works with no extra service. Everything
+(endpoint, timeouts, size caps, Jina fallback) is configurable — see the
+[pi-searxng README](https://github.com/MirecX/pi-searxng).
+
+## Using Claude Code with a Local LLM (optional)
+
+By default Claude Code talks to the hosted Anthropic API. To point it at a local
+Anthropic Messages-compatible endpoint instead, set `CLAUDE_LOCAL_LLM=true`. On startup the
+entrypoint generates `~/.claude/settings.json` with the right `ANTHROPIC_*` environment:
+
+```bash
+# .env
+CLAUDE_LOCAL_LLM=true
+# Base URL and token default to LLM_ENDPOINT / LLM_API_KEY (shared with pi).
+# Override only if Claude Code should use a different endpoint:
+# CLAUDE_BASE_URL=http://127.0.0.1:8001    # must NOT include /v1
+# CLAUDE_AUTH_TOKEN=sk-...
+# CLAUDE_MODEL=my-model                     # if unset, auto-discovered from {base}/v1/models
+```
+
+The generated `settings.json` sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, and points
+every model slot (`ANTHROPIC_MODEL`, `..._SMALL_FAST_MODEL`, `..._DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`)
+at the resolved model. The file is written `0600` and owned by the container user (it holds the
+token). Leave `CLAUDE_LOCAL_LLM` unset/`false` to keep Claude Code on the hosted API.
+
+> The target endpoint must speak the **Anthropic Messages** protocol (`POST /v1/messages`).
+> This is the same requirement as the `anthropic-no-timeout` pi transport; a litellm proxy in
+> front of an OpenAI-compatible server satisfies it.
+
 ## SSH Security Notes
 
 - SSH password authentication is disabled
@@ -248,3 +356,16 @@ pi                              # launch pi-coding-agent
 ## Exposed Ports
 
 - **22**: SSH server
+
+## Changelog
+
+### 2026-07-02
+
+- **Migrated pi to `@earendil-works/pi-coding-agent`.** The `@mariozechner/pi-coding-agent` package is deprecated; the project moved to the `@earendil-works` org ([earendil-works/pi](https://github.com/earendil-works/pi)). Updated the Docker install, the extension imports, and docs.
+- **Node bumped to 22.** New pi requires Node `>=22.19.0`; the image now pins the NodeSource major (`setup_${NODE_VERSION}.x`) instead of tracking a drifting LTS.
+- **`anthropic-no-timeout` is now a custom `api` (transport), not a provider.** pi keys stream handlers by `api`, so any provider can opt in per-endpoint via `"api": "anthropic-no-timeout"` while keeping its own `baseUrl`/`apiKey` (e.g. `work` → `openai-completions`, `home` → `anthropic-no-timeout`). Added the `LLM_API` env var (default `openai-completions`) to select the generated provider's transport without editing `models.json`.
+- **Fixed `models.json` permission bug.** `~/.pi` is a symlink into the persisted `/workspace/.home`, and `chown -R` doesn't traverse a symlinked argument — so the root-written `models.json` stayed `root:root 600` and `pi` (as the container user) got `EACCES`. The entrypoint now chowns the real target. (Affected both transports since the home-persistence feature landed.)
+- **Extension hardened against non-conforming proxies.** Switched from the SDK's strict `messages.stream()` accumulator to the raw `messages.create({stream:true})` iterator, so endpoints that violate Anthropic event ordering (e.g. litellm emitting a duplicate `message_start`) no longer fail with "Unexpected event order." Also set `maxTokens` on auto-discovered models (the no-timeout transport derives `max_tokens` from it).
+- **Claude Code + local LLM.** Added `CLAUDE_LOCAL_LLM` (gate) — when `true`, the entrypoint generates `~/.claude/settings.json` pointing Claude Code at a local Anthropic Messages endpoint. Base URL/token default to `LLM_ENDPOINT`/`LLM_API_KEY` (override with `CLAUDE_BASE_URL`/`CLAUDE_AUTH_TOKEN`); the model is taken from `CLAUDE_MODEL` or auto-discovered. See [Using Claude Code with a Local LLM](#using-claude-code-with-a-local-llm-optional).
+- **Added the pi-subagents extension.** Installed from [its repo](https://github.com/MirecX/pi-subagents) at build time (build args `PI_SUBAGENTS_REPO`/`PI_SUBAGENTS_REF`), not vendored. The entrypoint generates its `config.json` (`modelOverride`, `extraExtensions`, `toolExtensions`) from the discovered model + transport so subagents run on the local LLM. See [pi-subagents Extension](#pi-subagents-extension-optional).
+- **Added web search & fetch via [pi-searxng](https://github.com/MirecX/pi-searxng)** (forked + extended with a `web_fetch` tool: Readability/Turndown/PDF/Jina). Cloned and built at image build (`PI_SEARXNG_REPO`/`PI_SEARXNG_REF`). SearXNG is a **shared external instance** pointed at via `SEARXNG_URL` (port `9369` by convention) — one instance serves many boxes. pi-subagents' `researcher`/`worker` are wired to these tools automatically. See [Web search & fetch](#web-search--fetch-pi-searxng-extension).
