@@ -7,7 +7,7 @@ ARG INSTALL_PI=true
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
-ENV NODE_VERSION=20
+ENV NODE_VERSION=22
 ENV DOTNET_ROOT=/usr/share/dotnet
 ENV PATH=$PATH:$DOTNET_ROOT:$DOTNET_ROOT/tools
 
@@ -48,15 +48,16 @@ RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/s
     echo "ChallengeResponseAuthentication no" >> /etc/ssh/sshd_config && \
     echo "UsePAM yes" >> /etc/ssh/sshd_config
 
-# Install Node.js (latest stable LTS)
-RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
+# Install Node.js (>=22.19.0 required by @earendil-works/pi-coding-agent)
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && \
     apt-get install -y nodejs
 
 # Install pi-coding-agent globally (optional, controlled by INSTALL_PI)
+# Package migrated from @mariozechner to the @earendil-works org (https://github.com/earendil-works/pi).
 # Note: body-timeout fix is now handled by the anthropic-no-timeout extension
 RUN if [ "${INSTALL_PI}" = "true" ]; then \
         set -eux; \
-        npm install -g @mariozechner/pi-coding-agent; \
+        npm install -g @earendil-works/pi-coding-agent; \
     else \
         echo "Skipping pi-coding-agent install (INSTALL_PI=${INSTALL_PI})"; \
     fi
@@ -99,6 +100,42 @@ RUN if [ "${INSTALL_PI}" = "true" ]; then \
 RUN if [ "${INSTALL_PI}" = "true" ]; then \
         test -f /home/${USERNAME}/.pi/agent/extensions/anthropic-no-timeout/index.ts \
           || (echo "Missing home/yolo/.pi/agent/extensions/anthropic-no-timeout/index.ts (required when INSTALL_PI=true)" >&2 && exit 1); \
+    fi
+
+# Install the pi-subagents extension from its own repo (optional, controlled by INSTALL_PI).
+# Kept as a clone (not vendored) so the extension stays a single source of truth in its repo;
+# yolobox only owns the box-specific config.json, generated at runtime by entrypoint.sh.
+# Override PI_SUBAGENTS_REPO/REF to use a fork or pin a commit/tag. Changing REF busts the cache.
+ARG PI_SUBAGENTS_REPO=https://github.com/MirecX/pi-subagents
+ARG PI_SUBAGENTS_REF=main
+RUN if [ "${INSTALL_PI}" = "true" ]; then \
+        set -eux; \
+        su - ${USERNAME} -c "git clone '${PI_SUBAGENTS_REPO}' ~/.pi/agent/extensions/pi-subagents \
+            && git -C ~/.pi/agent/extensions/pi-subagents checkout '${PI_SUBAGENTS_REF}' \
+            && rm -rf ~/.pi/agent/extensions/pi-subagents/.git"; \
+        test -f /home/${USERNAME}/.pi/agent/extensions/pi-subagents/index.ts \
+          || (echo "pi-subagents clone missing index.ts (repo=${PI_SUBAGENTS_REPO} ref=${PI_SUBAGENTS_REF})" >&2 && exit 1); \
+    else \
+        echo "Skipping pi-subagents (INSTALL_PI=${INSTALL_PI})"; \
+    fi
+
+# Install the pi-searxng extension (web_search + web_fetch) from its repo (optional, INSTALL_PI).
+# Unlike the other extensions this one has npm deps and a build step (tsc -> dist/), so we
+# clone, `npm install`, then `npm run build`. The SearXNG endpoint is provided at runtime via
+# the SEARXNG_URL env var (a shared instance; see docker-compose.yml / .env).
+# NOTE: this fork's default branch is `master`.
+ARG PI_SEARXNG_REPO=https://github.com/MirecX/pi-searxng
+ARG PI_SEARXNG_REF=master
+RUN if [ "${INSTALL_PI}" = "true" ]; then \
+        set -eux; \
+        su - ${USERNAME} -c "git clone '${PI_SEARXNG_REPO}' ~/.pi/agent/extensions/pi-searxng \
+            && git -C ~/.pi/agent/extensions/pi-searxng checkout '${PI_SEARXNG_REF}' \
+            && rm -rf ~/.pi/agent/extensions/pi-searxng/.git \
+            && cd ~/.pi/agent/extensions/pi-searxng && npm install && npm run build"; \
+        test -f /home/${USERNAME}/.pi/agent/extensions/pi-searxng/dist/index.js \
+          || (echo "pi-searxng build missing dist/index.js (repo=${PI_SEARXNG_REPO} ref=${PI_SEARXNG_REF})" >&2 && exit 1); \
+    else \
+        echo "Skipping pi-searxng (INSTALL_PI=${INSTALL_PI})"; \
     fi
 
 # Fetch GitHub public keys (only if GITHUB_USERNAME is set)

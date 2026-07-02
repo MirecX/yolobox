@@ -21,6 +21,21 @@ services:
       # Simplified LLM configuration - auto-discovers models from endpoint
       LLM_ENDPOINT: ${LLM_ENDPOINT:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
+      # Transport for the generated provider: openai-completions (default) or
+      # anthropic-no-timeout (slow Anthropic-Messages endpoint; needs INSTALL_PI=true).
+      LLM_API: ${LLM_API:-}
+      # Point Claude Code at a local LLM. When true, the entrypoint writes
+      # ~/.claude/settings.json (ANTHROPIC_BASE_URL/token/model). Base URL and token
+      # default to LLM_ENDPOINT / LLM_API_KEY; model auto-discovers from {base}/v1/models.
+      CLAUDE_LOCAL_LLM: ${CLAUDE_LOCAL_LLM:-}
+      CLAUDE_BASE_URL: ${CLAUDE_BASE_URL:-}
+      CLAUDE_AUTH_TOKEN: ${CLAUDE_AUTH_TOKEN:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-}
+      # SearXNG endpoint for the pi-searxng extension (web_search/web_fetch). Point every
+      # box at ONE shared SearXNG instance; nothing is bundled per-box. Port 9369 by
+      # convention (avoids common forwarded ports). If unset, the extension defaults to
+      # http://localhost:9369.
+      SEARXNG_URL: ${SEARXNG_URL:-}
 
     ports:
       - "${HOST_PORT:-22222}:22"
