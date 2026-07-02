@@ -208,7 +208,7 @@ EOF
         # tools at it (both map to the same entry so the child loads it once).
         SUBAGENT_TOOLEXT='{}'
         if [ -f "$AGENT_DIR/extensions/pi-searxng/dist/index.js" ]; then
-            SUBAGENT_TOOLEXT='{"web_search":"pi-searxng/dist/index.js","web_fetch":"pi-searxng/dist/index.js"}'
+            SUBAGENT_TOOLEXT='{"internet_search":"pi-searxng/dist/index.js","web_fetch":"pi-searxng/dist/index.js"}'
         fi
         echo "entrypoint: writing pi-subagents config (model=work/${SUBAGENT_MODEL_ID}, extraExtensions=${SUBAGENT_EXTRA}, toolExtensions=${SUBAGENT_TOOLEXT})"
         jq -n \
