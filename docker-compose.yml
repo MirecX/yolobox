@@ -5,6 +5,11 @@ services:
       dockerfile: Dockerfile
       args:
         USERNAME: ${YOLO_USERNAME:-yolo}
+        # Bake the host user's UID/GID into the image so the container user and
+        # its home directory are created with matching ownership from the start.
+        # The entrypoint remap (below) remains as a runtime safety net.
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
         GITHUB_USERNAME: ${GITHUB_USERNAME}
         INSTALL_PI: ${INSTALL_PI:-true}
     image: ${DOCKER_IMAGE:-yoloimage}

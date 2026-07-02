@@ -2,6 +2,12 @@ FROM ubuntu:24.04
 
 # Build arguments
 ARG USERNAME=yolo
+# UID/GID the container user is created with. Build with your host user's IDs
+# (docker-compose passes HOST_UID/HOST_GID through) so the user and its home
+# directory match the host from the start; the entrypoint still remaps at
+# runtime if the image was built with different IDs.
+ARG USER_UID=1000
+ARG USER_GID=1000
 ARG GITHUB_USERNAME=""
 ARG INSTALL_PI=true
 
@@ -72,10 +78,15 @@ RUN wget https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/package
 
 # Create a non-root user with host-matching UID/GID, allow passwordless sudo
 RUN set -eux; \
-    # Remove default 'ubuntu' user if present (it occupies UID 1000)
+    # Remove the default 'ubuntu' user and whatever else occupies the target
+    # UID/GID, so useradd/groupadd can't fail or half-apply on a collision.
     if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi; \
-    groupadd -g 1000 ${USERNAME}; \
-    useradd -m -u 1000 -g 1000 -s /bin/bash ${USERNAME}; \
+    existing_user="$(getent passwd "${USER_UID}" | cut -d: -f1)"; \
+    if [ -n "$existing_user" ]; then userdel -r "$existing_user" || userdel "$existing_user" || true; fi; \
+    existing_group="$(getent group "${USER_GID}" | cut -d: -f1)"; \
+    if [ -n "$existing_group" ]; then groupdel "$existing_group" || true; fi; \
+    groupadd -g ${USER_GID} ${USERNAME}; \
+    useradd -m -u ${USER_UID} -g ${USER_GID} -s /bin/bash ${USERNAME}; \
     usermod -aG sudo ${USERNAME}; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-${USERNAME}; \
     chmod 440 /etc/sudoers.d/90-${USERNAME}; \

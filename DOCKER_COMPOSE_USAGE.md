@@ -86,26 +86,34 @@ docker compose up -d
 
 ## Host user / volume permissions
 
-The container user (`yolo`) is created with UID/GID 1000 in the image. If your host
-user has a different UID/GID, files the agent writes to the mounted `/workspace`
-would be inaccessible to you on the host. To consolidate, the entrypoint remaps the
-container user at startup, in this order of precedence:
+The container user (`yolo`) is created in the image with the `USER_UID` / `USER_GID`
+build args (default 1000). If your host user has a different UID/GID, files the agent
+writes to the mounted `/workspace` would be inaccessible to you on the host. UID/GID
+alignment happens at two levels:
 
-1. `HOST_UID` / `HOST_GID` if set,
-2. otherwise the current owner of the `/workspace` mount (auto-detect),
-3. otherwise the image default (1000).
+1. **Build time** — docker-compose passes `HOST_UID` / `HOST_GID` through as the
+   `USER_UID` / `USER_GID` build args, so an image you build yourself creates the
+   user and its home directory with your host IDs from the start.
+2. **Runtime** — the entrypoint remaps the user at startup (useful for prebuilt
+   images), resolving the target IDs in this order of precedence:
+   1. `HOST_UID` / `HOST_GID` if set,
+   2. otherwise the current owner of the `/workspace` mount (auto-detect),
+   3. otherwise the IDs baked into the image.
 
 In most cases auto-detect is enough. To be explicit (recommended for a fresh,
-empty workspace dir), set them to your host user before starting:
+empty workspace dir), set them to your host user before building/starting:
 
 ```bash
 echo "HOST_UID=$(id -u)" >> .env
 echo "HOST_GID=$(id -g)" >> .env
-docker compose up -d
+docker compose up -d --build
 ```
 
-The remap also re-owns any existing `/workspace` files still held by the old UID/GID,
-so switching an existing box over is safe.
+On every start the entrypoint also reconciles home-directory ownership with the
+user's effective UID/GID, and a remap re-owns any existing `/workspace` files still
+held by the old UID/GID — so switching an existing box over is safe, and a stale
+user-vs-home ownership mismatch (e.g. user 1001 but home 1000/1000) self-heals on
+the next container start.
 
 ## Running Multiple Boxes Simultaneously
 

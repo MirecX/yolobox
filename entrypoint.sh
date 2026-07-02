@@ -40,14 +40,20 @@ if [ "$TARGET_UID" != "$CURRENT_UID" ]; then
         || echo "entrypoint: warning - could not set UID ${TARGET_UID} (already in use?)" >&2
 fi
 
-# Re-own anything still held by the old IDs: the user's home plus any /workspace
-# files written under the previous UID/GID. usermod only rehomes home-dir files by
-# UID, so fix the GID and the volume explicitly. Runs only when an actual remap
-# happened, to avoid a needless recursive chown on every start.
+# Reconcile home ownership with the user's effective UID/GID by STATE, not by
+# event: an image built with different IDs, a chown interrupted on an earlier
+# boot, or a persisted store seeded from another box can all leave the user
+# (e.g. 1001) and its home (1000/1000) out of sync even when no remap happens
+# this boot. Only mismatched files are touched, so this is cheap when clean.
 EFFECTIVE_UID="$(id -u "${USERNAME}")"
 EFFECTIVE_GID="$(id -g "${USERNAME}")"
+find "$USER_HOME" -xdev \( ! -uid "$EFFECTIVE_UID" -o ! -gid "$EFFECTIVE_GID" \) \
+    -exec chown -h "${EFFECTIVE_UID}:${EFFECTIVE_GID}" {} + 2>/dev/null || true
+
+# When a remap actually happened this boot, also re-own /workspace files written
+# under the previous UID/GID (the volume can hold files from many owners, so it
+# is only safe to move the ones we know belonged to the old identity).
 if [ "$EFFECTIVE_UID" != "$CURRENT_UID" ] || [ "$EFFECTIVE_GID" != "$CURRENT_GID" ]; then
-    chown -R "${EFFECTIVE_UID}:${EFFECTIVE_GID}" "$USER_HOME" 2>/dev/null || true
     find /workspace -xdev \( -uid "$CURRENT_UID" -o -gid "$CURRENT_GID" \) \
         -exec chown -h "${EFFECTIVE_UID}:${EFFECTIVE_GID}" {} + 2>/dev/null || true
 fi
