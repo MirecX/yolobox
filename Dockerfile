@@ -55,8 +55,26 @@ RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/s
     echo "UsePAM yes" >> /etc/ssh/sshd_config
 
 # Install Node.js (>=22.19.0 required by @earendil-works/pi-coding-agent)
-RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && \
-    apt-get install -y nodejs
+# Installed from the official nodejs.org tarball rather than NodeSource: the
+# deb.nodesource.com setup script and gpg key currently return HTTP 403, and a
+# non-fatal fetch there silently falls back to Ubuntu's nodejs 18, which ships
+# no npm at all. Fail loudly instead, and verify npm is present.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) node_arch=x64 ;; \
+        arm64) node_arch=arm64 ;; \
+        *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    node_ver="$(curl -fsSL https://nodejs.org/dist/index.json \
+        | jq -r --arg m "v${NODE_VERSION}." '[.[] | select(.version | startswith($m))][0].version')"; \
+    test -n "$node_ver" -a "$node_ver" != "null"; \
+    curl -fsSL "https://nodejs.org/dist/${node_ver}/node-${node_ver}-linux-${node_arch}.tar.xz" -o /tmp/node.tar.xz; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+        --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md; \
+    rm /tmp/node.tar.xz; \
+    node --version; \
+    npm --version
 
 # Install pi-coding-agent globally (optional, controlled by INSTALL_PI)
 # Package migrated from @mariozechner to the @earendil-works org (https://github.com/earendil-works/pi).
